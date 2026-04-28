@@ -5,6 +5,9 @@ import {
     sendMessage, sendWithFile, getBubbleCount, waitForResponse, parseBoolFlag, withRetry,
 } from './utils.js';
 
+/**
+ opencli deepseek ask --new --think --search --model expert --format plain "What are the latest trends in AI research?"
+ */
 export const askCommand = cli({
     site: 'deepseek',
     name: 'ask',

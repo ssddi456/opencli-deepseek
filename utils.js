@@ -1,3 +1,5 @@
+import { REACT_MSG_HELPERS } from './REACT_MSG_HELPERS.js';
+
 export const DEEPSEEK_DOMAIN = 'chat.deepseek.com';
 export const DEEPSEEK_URL = 'https://chat.deepseek.com/';
 export const TEXTAREA_SELECTOR = 'textarea[placeholder*="DeepSeek"]';
@@ -78,7 +80,7 @@ export async function sendMessage(page, prompt) {
         for (const btn of btns) {
             if (btn.getAttribute('aria-disabled') === 'false') {
                 const svgs = btn.querySelectorAll('svg');
-                if (svgs.length > 0 && btn.closest('div')?.querySelector('textarea')) {
+                if (svgs.length > 0 && btn.parentElement?.previousSibling?.tagName === 'INPUT') {
                     btn.click();
                     return { ok: true };
                 }
@@ -132,13 +134,19 @@ export async function waitForResponse(page, baselineCount, prompt, timeoutMs, pa
 
     while (Date.now() - startTime < timeoutMs) {
         await page.wait(3);
-
+        console.log('Checking for new response...'); // Debug log
         let result;
         try {
-            result = await page.evaluate(`(() => {
+            result = await page.evaluate(`
+                (() => {
+                ;;${REACT_MSG_HELPERS};;
                 const bubbles = document.querySelectorAll('${MESSAGE_SELECTOR}');
                 const texts = Array.from(bubbles).map(b => (b.innerText || '').trim()).filter(Boolean);
                 var last = texts[texts.length - 1] || '';
+                var lastBubble = bubbles.length > 0 ? bubbles[bubbles.length - 1] : null;
+
+                // Try to get raw markdown from React tree for the last bubble
+                var reactMarkdown = lastBubble ? __findMessageInDomTree(lastBubble) : null;
 
                 // DOM-level thinking/response separation.
                 // DeepSeek renders thinking in a collapsible container with a
@@ -146,8 +154,8 @@ export async function waitForResponse(page, baselineCount, prompt, timeoutMs, pa
                 // final answer in the main .ds-markdown region.  By querying
                 // these separately we avoid any text-heuristic split.
                 var thinkEl = null, answerEl = null, thinkTime = null;
-                if (${parseThinking} && bubbles.length > 0) {
-                    var lastBubble = bubbles[bubbles.length - 1];
+                var reactAnswerMarkdown = null;
+                if (${parseThinking} && lastBubble) {
                     // Thinking container — DeepSeek uses various class names;
                     // try common selectors.
                     thinkEl = lastBubble.querySelector('.ds-markdown--think')
@@ -161,6 +169,10 @@ export async function waitForResponse(page, baselineCount, prompt, timeoutMs, pa
                             && !markdownEls[i].classList.contains('ds-markdown--think')) {
                             answerEl = markdownEls[i];
                         }
+                    }
+                    // Try to get raw markdown for the answer element from React tree
+                    if (answerEl) {
+                        reactAnswerMarkdown = __findMessageInDomTree(answerEl);
                     }
                     // Thinking time from the toggle/header element
                     var timeEl = lastBubble.querySelector('[class*="think"] ~ *')
@@ -178,17 +190,31 @@ export async function waitForResponse(page, baselineCount, prompt, timeoutMs, pa
                 return {
                     count: texts.length,
                     last: last,
+                    loading: reactMarkdown ? reactMarkdown.loading : false,
+                    // Raw markdown from React tree (preferred over innerText)
+                    reactMarkdown: reactMarkdown ? reactMarkdown.content : null,
                     // DOM-separated fields (null when not available)
                     thinkText: thinkEl ? (thinkEl.innerText || '').trim() : null,
                     answerText: answerEl ? (answerEl.innerText || '').trim() : null,
+                    // Raw markdown for answer from React tree
+                    reactAnswerMarkdown: reactAnswerMarkdown ? reactAnswerMarkdown.content : null,
                     thinkTime: thinkTime,
+                    log: __log,
                 };
             })()`);
-        } catch {
+            console.log('Evaluation result:', result); // Debug log
+            if (result?.log?.length) console.log('[REACT_LOG]', result.log);
+        } catch (e) {
+            console.error('Error evaluating page for response:', e);
             continue;
         }
 
         if (!result) continue;
+
+        if (result.loading) {
+            stableCount = 0;
+            continue;
+        }
 
         const candidate = result.last;
         if (candidate && result.count > baselineCount && candidate !== prompt.trim()) {
@@ -200,14 +226,16 @@ export async function waitForResponse(page, baselineCount, prompt, timeoutMs, pa
                         if (result.thinkText != null || result.answerText != null) {
                             return {
                                 thinking: result.thinkText || '',
-                                response: result.answerText || '',
+                                // Prefer raw markdown from React tree over innerText
+                                response: result.reactAnswerMarkdown || result.answerText || '',
                                 thinking_time: result.thinkTime || null,
                             };
                         }
                         // Fallback to text-header parsing (no \n\n split)
                         return parseThinkingResponse(candidate);
                     }
-                    return candidate;
+                    // Prefer raw markdown from React tree over innerText
+                    return result.reactMarkdown || candidate;
                 }
             } else {
                 stableCount = 0;
