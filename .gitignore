@@ -1,0 +1,8 @@
+vendor/
+downloads/
+output/
+tmp/
+.runtime-home/
+info.json
+*.log
+node_modules/

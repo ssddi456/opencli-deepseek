@@ -1,0 +1,9 @@
+{
+  "name": "opencli-plugin-deepseek",
+  "version": "0.1.0",
+  "description": "OpenCLI plugin for DeepSeek — chat with DeepSeek AI from your terminal",
+  "type": "module",
+  "peerDependencies": {
+    "@jackwener/opencli": "^1.7.8"
+  }
+}

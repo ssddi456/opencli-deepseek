@@ -1,0 +1,6 @@
+{
+  "name": "deepseek",
+  "version": "0.1.0",
+  "opencli": ">=1.0.0",
+  "description": "OpenCLI plugin for DeepSeek — chat with DeepSeek AI from your terminal"
+}
