@@ -1,3 +1,4 @@
+import { readFileSync } from 'fs';
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { CliError, CommandExecutionError, EXIT_CODES } from '@jackwener/opencli/errors';
 import {
@@ -18,7 +19,8 @@ export const askCommand = cli({
     navigateBefore: false,
     timeoutSeconds: 180,
     args: [
-        { name: 'prompt', positional: true, required: true, help: 'Prompt to send' },
+        { name: 'prompt', positional: true, type: 'string', required: false, help: 'Prompt to send to DeepSeek (mutually exclusive with --prompt_file)' },
+        { name: 'prompt_file', type: 'string', required: false, help: 'Path to a file whose content will be used as the prompt (mutually exclusive with prompt)' },
         { name: 'timeout', type: 'int', default: 120, help: 'Max seconds to wait for response' },
         { name: 'new', type: 'boolean', default: false, help: 'Start a new chat before sending' },
         { name: 'model', default: 'instant', choices: ['instant', 'expert'], help: 'Model to use: instant or expert' },
@@ -29,7 +31,15 @@ export const askCommand = cli({
     // columns omitted: derived from row keys so non-think output shows only 'response'
 
     func: async (page, kwargs) => {
-        const prompt = kwargs.prompt;
+        if (kwargs.prompt && kwargs.prompt_file) {
+            throw new CliError('ARGUMENT', 'prompt and --prompt_file are mutually exclusive.', 'Provide only one of them.', EXIT_CODES.USAGE_ERROR);
+        }
+        if (!kwargs.prompt && !kwargs.prompt_file) {
+            throw new CliError('ARGUMENT', 'Either prompt or --prompt_file is required.', 'Provide a prompt string or a file path via --prompt_file.', EXIT_CODES.USAGE_ERROR);
+        }
+        const prompt = kwargs.prompt_file
+            ? readFileSync(kwargs.prompt_file, 'utf8').trim()
+            : kwargs.prompt;
         const timeoutMs = (kwargs.timeout || 120) * 1000;
         const wantThink = parseBoolFlag(kwargs.think);
         const wantSearch = parseBoolFlag(kwargs.search);
