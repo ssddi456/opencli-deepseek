@@ -401,3 +401,187 @@ export function parseBoolFlag(value) {
     if (typeof value === 'boolean') return value;
     return String(value ?? '').trim().toLowerCase() === 'true';
 }
+
+/**
+ * Inject an SSE-aware fetch interceptor that captures the raw stream body
+ * of the DeepSeek completion API and stores it in window.__opencli_xhr so
+ * page.getInterceptedRequests() can retrieve it afterwards.
+ * Must be called before sending the message.
+ */
+export async function setupResponseCapture(page) {
+    console.log('[capture] installing SSE interceptor');
+    await page.evaluate(`(() => {
+        // Reset capture state each time a new message is sent
+        if (!window.__opencli_xhr) window.__opencli_xhr = [];
+        else window.__opencli_xhr.length = 0;
+        window.__opencli_xhr_done = false;
+        window.__opencli_xhr_pending = 0;
+
+        // Guard: only patch fetch/XHR once per page lifetime
+        if (window.__opencli_xhr_sse_patched) {
+            console.log('[capture] fetch already patched, reset state only');
+            return;
+        }
+        window.__opencli_xhr_sse_patched = true;
+        console.log('[capture] fetch + XHR patched');
+
+        const TARGET = '/api/v0/chat/completion';
+
+        function __captureFinished() {
+            window.__opencli_xhr_pending = Math.max(0, (window.__opencli_xhr_pending || 1) - 1);
+            if (window.__opencli_xhr_pending === 0) {
+                window.__opencli_xhr_done = true;
+                console.log('[capture] all pending requests done, total captured:', window.__opencli_xhr.length);
+            }
+        }
+
+        // ── Patch fetch ──
+        const _origFetch = window.fetch;
+        window.fetch = async function(...args) {
+            const response = await _origFetch.apply(this, args);
+            const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+            if (url.includes(TARGET)) {
+                console.log('[capture] fetch intercepted completion request:', url);
+                window.__opencli_xhr_pending = (window.__opencli_xhr_pending || 0) + 1;
+                window.__opencli_xhr_done = false;
+                const cloned = response.clone();
+                (async () => {
+                    try {
+                        const reader = cloned.body.getReader();
+                        const decoder = new TextDecoder();
+                        let raw = '';
+                        let chunks = 0;
+                        for (;;) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            raw += decoder.decode(value, { stream: true });
+                            chunks++;
+                        }
+                        // Flush any bytes remaining in the decoder buffer
+                        raw += decoder.decode();
+                        console.log('[capture] fetch stream finished, chunks:', chunks, 'bytes:', raw.length);
+                        window.__opencli_xhr.push(raw);
+                    } catch (e) {
+                        console.log('[capture] fetch stream error:', String(e));
+                    } finally {
+                        __captureFinished();
+                    }
+                })();
+            }
+            return response;
+        };
+
+        // ── Patch XMLHttpRequest ──
+        const _origOpen = XMLHttpRequest.prototype.open;
+        const _origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this.__captureUrl = String(url || '');
+            return _origOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function() {
+            if (this.__captureUrl && this.__captureUrl.includes(TARGET)) {
+                console.log('[capture] XHR intercepted completion request:', this.__captureUrl);
+                window.__opencli_xhr_pending = (window.__opencli_xhr_pending || 0) + 1;
+                window.__opencli_xhr_done = false;
+                this.addEventListener('load', function() {
+                    try {
+                        const raw = this.responseText || '';
+                        console.log('[capture] XHR response received, bytes:', raw.length);
+                        window.__opencli_xhr.push(raw);
+                    } finally {
+                        __captureFinished();
+                    }
+                });
+                this.addEventListener('error', function() {
+                    console.log('[capture] XHR request error');
+                    __captureFinished();
+                });
+            }
+            return _origSend.apply(this, arguments);
+        };
+    })()`);
+}
+
+/**
+ * Poll until the intercepted SSE stream is finished or the timeout elapses,
+ * then drain and return the raw SSE text via page.getInterceptedRequests().
+ */
+export async function waitForCapturedResponse(page, timeoutMs) {
+    const startTime = Date.now();
+    console.log('[capture] waiting for SSE stream to finish (timeout:', timeoutMs, 'ms)');
+    while (Date.now() - startTime < timeoutMs) {
+        await page.wait(2);
+        const elapsed = Date.now() - startTime;
+        const state = await page.evaluate(
+            '({ active: window.__opencli_xhr_sse_patched || false, done: window.__opencli_xhr_done || false, pending: window.__opencli_xhr_pending || 0 })'
+        );
+        console.log(`[capture] poll at ${elapsed}ms — active:${state?.active} done:${state?.done} pending:${state?.pending}`);
+        if (state?.done) {
+            const items = await page.getInterceptedRequests();
+            console.log('[capture] stream done, captured items:', items.length);
+            if (items.length === 0) return null;
+            // Merge all captured SSE chunks (handles auto_continue multi-request)
+            return items.length === 1 ? items[0] : items.join('\n');
+        }
+        // Fetch hook never fired after 15 s — give up
+        if (!state?.active && elapsed > 15000) {
+            console.log('[capture] fetch hook never fired, giving up');
+            return null;
+        }
+    }
+    console.log('[capture] timed out waiting for stream');
+    return null;
+}
+
+/**
+ * Parse a DeepSeek SSE body and return the accumulated RESPONSE fragment content.
+ * Only collects text from fragments of type RESPONSE (skips SEARCH, THINKING, etc.).
+ */
+export function parseSSEContent(sseText) {
+    if (!sseText) return null;
+    console.log('[parse] parsing SSE body, length:', sseText.length);
+    let content = '';
+    let tracking = false;
+
+    for (const line of sseText.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        const jsonStr = line.slice(6).trim();
+        if (!jsonStr) continue;
+        let data;
+        try { data = JSON.parse(jsonStr); } catch { continue; }
+
+        // ── Initial full response frame: {"v":{"response":{"fragments":[...]}}}
+        // This is the first substantive frame; extract initial content from RESPONSE fragments.
+        if (data.p === undefined && data.o === undefined && data.v?.response?.fragments) {
+            for (const frag of data.v.response.fragments) {
+                if (frag.type === 'RESPONSE' && frag.content) {
+                    content += frag.content;
+                    tracking = true;
+                }
+            }
+        // ── BATCH op: appending new fragments (e.g. after SEARCH finishes)
+        } else if (data.p === 'response' && data.o === 'BATCH' && Array.isArray(data.v)) {
+            for (const op of data.v) {
+                if (op.p === 'fragments' && op.o === 'APPEND' && Array.isArray(op.v)) {
+                    for (const frag of op.v) {
+                        if (frag.type === 'RESPONSE') {
+                            content += frag.content || '';
+                            tracking = true;
+                        }
+                    }
+                }
+            }
+        // ── Path-based APPEND to the last fragment's content field
+        } else if (data.p === 'response/fragments/-1/content' && data.o === 'APPEND') {
+            content += data.v || '';
+            tracking = true;
+        // ── Short-form token delta {"v":"..."} emitted while tracking a RESPONSE fragment
+        } else if (tracking && typeof data.v === 'string' && data.p === undefined && data.o === undefined) {
+            content += data.v;
+        }
+    }
+
+    const result = content.trim() || null;
+    console.log('[parse] extracted content length:', result?.length ?? 0);
+    return result;
+}

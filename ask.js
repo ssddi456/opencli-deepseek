@@ -3,7 +3,8 @@ import { cli, Strategy } from '@jackwener/opencli/registry';
 import { CliError, CommandExecutionError, EXIT_CODES } from '@jackwener/opencli/errors';
 import {
     DEEPSEEK_DOMAIN, DEEPSEEK_URL, ensureOnDeepSeek, selectModel, setFeature,
-    sendMessage, sendWithFile, getBubbleCount, waitForResponse, parseBoolFlag, withRetry,
+    sendMessage, sendWithFile, setupResponseCapture, waitForCapturedResponse, parseSSEContent,
+    parseBoolFlag, withRetry,
 } from './utils.js';
 
 /**
@@ -98,8 +99,9 @@ export const askCommand = cli({
 
         if (thinkResult?.toggled || searchResult?.toggled) await page.wait(0.5);
 
+        await setupResponseCapture(page);
+
         if (kwargs.file) {
-            const baseline = await withRetry(() => getBubbleCount(page));
             try {
                 const fileResult = await sendWithFile(page, kwargs.file, prompt);
                 if (fileResult && !fileResult.ok) {
@@ -109,31 +111,22 @@ export const askCommand = cli({
                 // SPA navigates after send; "Promise was collected" means send succeeded
                 if (!String(err?.message || err).includes('Promise was collected')) throw err;
             }
-            await page.wait(3);
-            const result = await waitForResponse(page, baseline, prompt, timeoutMs, wantThink);
-            if (!result) {
-                return [{ response: `[NO RESPONSE] No reply within ${kwargs.timeout}s.` }];
+        } else {
+            const sendResult = await withRetry(() => sendMessage(page, prompt));
+            if (!sendResult?.ok) {
+                throw new CommandExecutionError(sendResult?.reason || 'Failed to send message');
             }
-            if (wantThink && typeof result === 'object' && result.response !== undefined) {
-                return [result];
-            }
-            return [{ response: result }];
         }
 
-        const baseline = await withRetry(() => getBubbleCount(page));
-        const sendResult = await withRetry(() => sendMessage(page, prompt));
-        if (!sendResult?.ok) {
-            throw new CommandExecutionError(sendResult?.reason || 'Failed to send message');
-        }
-
-        const result = await waitForResponse(page, baseline, prompt, timeoutMs, wantThink);
-        if (!result) {
+        const raw = await waitForCapturedResponse(page, timeoutMs);
+        const content = parseSSEContent(raw);
+        if (!content) {
             return [{ response: `[NO RESPONSE] No reply within ${kwargs.timeout}s.` }];
         }
 
-        if (wantThink && typeof result === 'object' && result.response !== undefined) {
-            return [result];
+        if (wantThink) {
+            return [{ response: content, thinking: null, thinking_time: null }];
         }
-        return [{ response: result }];
+        return [{ response: content }];
     },
 });
